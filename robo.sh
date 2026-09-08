@@ -1,0 +1,1 @@
+rebar3 shell --apps robo_robot
