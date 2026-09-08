@@ -91,9 +91,19 @@ handle_info({task_received, Handler, Goal}, State) ->
 handle_info({robot_message, RobotId, {moved, RobotId, NewPosition}}, State) ->
     handle_robot_move(RobotId, NewPosition, State);
 
-handle_info({robot_message, RobotId, {window_complete, RobotId}}, State) ->
-    io:format("Robot ~p completed its window~n", [RobotId]),
-    {noreply, send_next_window(RobotId, State)};
+handle_info({robot_message, RobotId, {window_complete, RobotId, Goal}}, State) ->
+    NewState =
+        case maps:find(RobotId, maps:get(robots, State)) of
+            {ok, #{status := busy, goal := Goal}} ->
+                io:format("Robot ~p prefetching next window~n", [RobotId]),
+                send_next_window(RobotId, State);
+
+            _ ->
+                %% Stale: robot already finished/changed tasks in the
+                %% time it took this message to arrive. Ignore it.
+                State
+        end,
+    {noreply, NewState};
 
 handle_info({robot_disconnected, RobotId}, State) ->
     io:format("Robot ~p disconnected~n", [RobotId]),
