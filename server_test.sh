@@ -1,0 +1,1 @@
+rebar3 eunit --module=robo_server_tests
