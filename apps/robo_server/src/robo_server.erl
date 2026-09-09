@@ -6,18 +6,9 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
-% -define(WINDOW_SIZE, 3).
-
-%% Static obstacles for the demo grid.
-% -define(OBSTACLES, [{9,3}, {8,3}, {7,3}, {7,2}]).
-
-
-
-window_size() -> application:get_env(robo_server, window_size, 3).
-obstacles()   -> application:get_env(robo_server, obstacles, []).
-port() -> application:get_env(robo_server, tcp_port, 5555).
-
-
+-ifdef(TEST).
+-export([next_positions/3, expected_next/2]).
+-endif.
 
 
 start_link() ->
@@ -27,6 +18,24 @@ start_link() ->
 submit_task(Goal) ->
     gen_server:call(?MODULE, {submit_task, Goal}).
 
+
+%%--------------------------------------------------------------------
+%% Config
+%%--------------------------------------------------------------------
+
+port() ->
+    application:get_env(robo_server, tcp_port, 5555).
+
+window_size() ->
+    application:get_env(robo_server, window_size, 3).
+
+obstacles() ->
+    application:get_env(robo_server, obstacles, []).
+
+
+%%--------------------------------------------------------------------
+%% Init
+%%--------------------------------------------------------------------
 
 init([]) ->
     {ok, ListenSocket} = gen_tcp:listen(
@@ -50,7 +59,7 @@ init([]) ->
         reservations => Reservations
     },
 
-    io:format("Server listening on port 5555~n"),
+    io:format("Server listening on port ~p~n", [port()]),
 
     {ok, State}.
 
@@ -107,7 +116,8 @@ handle_info(
         current => Current,
         status => idle,
         goal => undefined,
-        path => []
+        path => [],
+        window => []
     },
 
     NewRobots =
@@ -322,19 +332,6 @@ handle_robot_move(RobotId, NewPosition, State) ->
                                 State
                             ),
 
-                            UpdatedRobot =
-                                Robot#{
-                                    current =>
-                                        NewPosition
-                                },
-
-                            NewRobots =
-                                maps:put(
-                                    RobotId,
-                                    UpdatedRobot,
-                                    Robots
-                                ),
-
                             case NewPosition =:= Goal of
 
                                 %%----------------------------------------
@@ -343,10 +340,7 @@ handle_robot_move(RobotId, NewPosition, State) ->
                                 true ->
 
                                     Handler =
-                                        maps:get(
-                                            handler,
-                                            Robot
-                                        ),
+                                        maps:get(handler, Robot),
 
                                     Handler !
                                         {send,
@@ -359,29 +353,28 @@ handle_robot_move(RobotId, NewPosition, State) ->
                                     ),
 
                                     FinalRobot =
-                                        UpdatedRobot#{
+                                        Robot#{
+                                            current => NewPosition,
                                             status => idle,
                                             goal => undefined,
-                                            path => []
+                                            path => [],
+                                            window => []
                                         },
 
                                     FinalRobots =
                                         maps:put(
                                             RobotId,
                                             FinalRobot,
-                                            NewRobots
+                                            Robots
                                         ),
 
                                     NewState =
                                         State#{
-                                            robots =>
-                                                FinalRobots
+                                            robots => FinalRobots
                                         },
 
                                     {noreply,
-                                     process_tasks(
-                                         NewState
-                                     )};
+                                     process_tasks(NewState)};
 
 
                                 %%----------------------------------------
@@ -390,60 +383,74 @@ handle_robot_move(RobotId, NewPosition, State) ->
                                 false ->
 
                                     Handler =
-                                        maps:get(
-                                            handler,
-                                            Robot
-                                        ),
+                                        maps:get(handler, Robot),
 
-                                    %% Acknowledge the movement first.
-                                    Handler !
-                                        {send,
-                                         {move_ack,
-                                          NewPosition}},
+                                    Window = maps:get(window, Robot),
 
-                                    NewState =
-                                        State#{
-                                            robots =>
-                                                NewRobots
+                                    RestWindow =
+                                        case Window of
+                                            [NewPosition | Tail] -> Tail;
+                                            _ -> []
+                                        end,
+
+                                    Robot1 =
+                                        Robot#{
+                                            current => NewPosition,
+                                            window => RestWindow
                                         },
 
-                                    %% If this was the last reserved
-                                    %% position of the current window,
-                                    %% the server automatically sends
-                                    %% the next window.
-                                    case has_reservations(
-                                        RobotId,
-                                        NewState
-                                    ) of
+                                    NewRobots1 =
+                                        maps:put(RobotId, Robot1, Robots),
 
-                                        true ->
-                                            {
-                                                noreply,
-                                                process_waiting_robots(
+                                    NewState =
+                                        State#{robots => NewRobots1},
+
+                                    %% Acknowledge the movement.
+                                    Handler !
+                                        {send,
+                                         {move_ack, NewPosition}},
+
+                                    FinalState =
+                                        case RestWindow of
+
+                                            [LastPos] ->
+                                                %% Exactly one reserved
+                                                %% cell left, not yet
+                                                %% walked -- this is the
+                                                %% robot's LAST step of
+                                                %% the current window.
+                                                %% Try to reserve and send
+                                                %% the NEXT window now,
+                                                %% before the robot has
+                                                %% even attempted that
+                                                %% last step.
+                                                maybe_prefetch_next_window(
+                                                    RobotId,
+                                                    LastPos,
                                                     NewState
-                                                )
-                                            };
+                                                );
 
-                                        false ->
-                                            io:format(
-                                                "Window complete for ~p, "
-                                                "sending next window~n",
-                                                [RobotId]
-                                            ),
-
-                                            NextState =
+                                            [] ->
+                                                %% Nothing was prefetched
+                                                %% earlier (e.g. it
+                                                %% conflicted) -- fall
+                                                %% back to old behaviour.
+                                                io:format(
+                                                    "Window complete for ~p, "
+                                                    "sending next window~n",
+                                                    [RobotId]
+                                                ),
                                                 send_next_window(
                                                     RobotId,
                                                     NewState
-                                                ),
+                                                );
 
-                                            {
-                                                noreply,
-                                                process_waiting_robots(
-                                                    NextState
-                                                )
-                                            }
-                                    end
+                                            _StillWalking ->
+                                                NewState
+                                        end,
+
+                                    {noreply,
+                                     process_waiting_robots(FinalState)}
                             end;
 
 
@@ -453,10 +460,7 @@ handle_robot_move(RobotId, NewPosition, State) ->
                         [{NewPosition, OtherRobot}] ->
 
                             Handler =
-                                maps:get(
-                                    handler,
-                                    Robot
-                                ),
+                                maps:get(handler, Robot),
 
                             Handler !
                                 {send,
@@ -464,13 +468,8 @@ handle_robot_move(RobotId, NewPosition, State) ->
                                   {position_reserved_by,
                                    OtherRobot}}},
 
-                            {
-                                noreply,
-                                replan_robot(
-                                    RobotId,
-                                    State
-                                )
-                            };
+                            {noreply,
+                             replan_robot(RobotId, State)};
 
 
                         %%------------------------------------------------
@@ -479,23 +478,15 @@ handle_robot_move(RobotId, NewPosition, State) ->
                         [] ->
 
                             Handler =
-                                maps:get(
-                                    handler,
-                                    Robot
-                                ),
+                                maps:get(handler, Robot),
 
                             Handler !
                                 {send,
                                  {move_denied,
                                   position_not_reserved}},
 
-                            {
-                                noreply,
-                                replan_robot(
-                                    RobotId,
-                                    State
-                                )
-                            }
+                            {noreply,
+                             replan_robot(RobotId, State)}
                     end;
 
 
@@ -505,10 +496,7 @@ handle_robot_move(RobotId, NewPosition, State) ->
                 {ok, ExpectedPosition} ->
 
                     Handler =
-                        maps:get(
-                            handler,
-                            Robot
-                        ),
+                        maps:get(handler, Robot),
 
                     Handler !
                         {send,
@@ -516,27 +504,17 @@ handle_robot_move(RobotId, NewPosition, State) ->
                           {unexpected_position,
                            ExpectedPosition}}},
 
-                    {
-                        noreply,
-                        replan_robot(
-                            RobotId,
-                            State
-                        )
-                    };
+                    {noreply,
+                     replan_robot(RobotId, State)};
 
 
                 {error, Reason} ->
 
                     Handler =
-                        maps:get(
-                            handler,
-                            Robot
-                        ),
+                        maps:get(handler, Robot),
 
                     Handler !
-                        {send,
-                         {move_denied,
-                          Reason}},
+                        {send, {move_denied, Reason}},
 
                     {noreply, State}
             end
@@ -566,23 +544,9 @@ process_tasks(State) ->
 
                 {{value, Task}, NewTasks} ->
 
-                    Goal =
-                        maps:get(
-                            goal,
-                            Task
-                        ),
-
-                    Robot =
-                        maps:get(
-                            RobotId,
-                            Robots
-                        ),
-
-                    Current =
-                        maps:get(
-                            current,
-                            Robot
-                        ),
+                    Goal = maps:get(goal, Task),
+                    Robot = maps:get(RobotId, Robots),
+                    Current = maps:get(current, Robot),
 
                     case Current =:= Goal of
 
@@ -591,53 +555,33 @@ process_tasks(State) ->
                             io:format(
                                 "Task ~p already completed by "
                                 "robot ~p at ~p~n",
-                                [
-                                    maps:get(id, Task),
-                                    RobotId,
-                                    Goal
-                                ]
+                                [maps:get(id, Task), RobotId, Goal]
                             ),
 
                             process_tasks(
-                                State#{
-                                    tasks => NewTasks
-                                }
+                                State#{tasks => NewTasks}
                             );
 
                         false ->
 
-                            case assign_task(
-                                RobotId,
-                                Goal,
-                                State
-                            ) of
+                            case assign_task(RobotId, Goal, State) of
 
                                 {ok, NewState} ->
-
                                     process_tasks(
-                                        NewState#{
-                                            tasks =>
-                                                NewTasks
-                                        }
+                                        NewState#{tasks => NewTasks}
                                     );
 
                                 {error, no_path, NewState} ->
 
                                     io:format(
                                         "No path for task ~p -> ~p~n",
-                                        [
-                                            maps:get(id, Task),
-                                            Goal
-                                        ]
+                                        [maps:get(id, Task), Goal]
                                     ),
 
                                     %% Keep task queued.
                                     NewState#{
                                         tasks =>
-                                            queue:in_r(
-                                                Task,
-                                                NewTasks
-                                            )
+                                            queue:in_r(Task, NewTasks)
                                     }
                             end
                     end
@@ -674,11 +618,7 @@ assign_task(RobotId, Goal, State) ->
     Current = maps:get(current, Robot),
     Obstacles = maps:get(obstacles, State),
 
-    case robo_pathfinder:find_path(
-        Current,
-        Goal,
-        Obstacles
-    ) of
+    case robo_pathfinder:find_path(Current, Goal, Obstacles) of
 
         {ok, Path} ->
 
@@ -690,51 +630,27 @@ assign_task(RobotId, Goal, State) ->
                 },
 
             NewRobots =
-                maps:put(
-                    RobotId,
-                    UpdatedRobot,
-                    Robots
-                ),
+                maps:put(RobotId, UpdatedRobot, Robots),
 
             State1 =
-                State#{
-                    robots => NewRobots
-                },
+                State#{robots => NewRobots},
 
-            case reserve_next_window(
-                RobotId,
-                State1
-            ) of
+            case reserve_next_window(RobotId, State1) of
 
                 {ok, State2, Window} ->
 
-                    Handler =
-                        maps:get(
-                            handler,
-                            Robot
-                        ),
+                    Handler = maps:get(handler, Robot),
 
-                    Handler !
-                        {send,
-                         {go,
-                          Goal,
-                          Window}},
+                    Handler ! {send, {go, Goal, Window}},
 
                     io:format(
                         "Assigned robot ~p: ~p -> ~p~n",
-                        [
-                            RobotId,
-                            Current,
-                            Goal
-                        ]
+                        [RobotId, Current, Goal]
                     ),
 
                     io:format(
                         "Window for ~p: ~p~n",
-                        [
-                            RobotId,
-                            Window
-                        ]
+                        [RobotId, Window]
                     ),
 
                     {ok, State2};
@@ -749,15 +665,12 @@ assign_task(RobotId, Goal, State) ->
 
 
 %%--------------------------------------------------------------------
-%% Send next window
+%% Send next window (fallback path, used when nothing was prefetched)
 %%--------------------------------------------------------------------
 
 send_next_window(RobotId, State) ->
 
-    case maps:find(
-        RobotId,
-        maps:get(robots, State)
-    ) of
+    case maps:find(RobotId, maps:get(robots, State)) of
 
         error ->
             State;
@@ -768,37 +681,18 @@ send_next_window(RobotId, State) ->
 
                 busy ->
 
-                    case reserve_next_window(
-                        RobotId,
-                        State
-                    ) of
+                    case reserve_next_window(RobotId, State) of
 
                         {ok, NewState, Window} ->
 
-                            Handler =
-                                maps:get(
-                                    handler,
-                                    Robot
-                                ),
+                            Handler = maps:get(handler, Robot),
+                            Goal = maps:get(goal, Robot),
 
-                            Goal =
-                                maps:get(
-                                    goal,
-                                    Robot
-                                ),
-
-                            Handler !
-                                {send,
-                                 {go,
-                                  Goal,
-                                  Window}},
+                            Handler ! {send, {go, Goal, Window}},
 
                             io:format(
                                 "Next window for ~p: ~p~n",
-                                [
-                                    RobotId,
-                                    Window
-                                ]
+                                [RobotId, Window]
                             ),
 
                             NewState;
@@ -812,26 +706,15 @@ send_next_window(RobotId, State) ->
                             ),
 
                             WaitingRobot =
-                                Robot#{
-                                    status => waiting
-                                },
+                                Robot#{status => waiting},
 
                             Robots =
-                                maps:get(
-                                    robots,
-                                    NewState
-                                ),
+                                maps:get(robots, NewState),
 
                             NewRobots =
-                                maps:put(
-                                    RobotId,
-                                    WaitingRobot,
-                                    Robots
-                                ),
+                                maps:put(RobotId, WaitingRobot, Robots),
 
-                            NewState#{
-                                robots => NewRobots
-                            }
+                            NewState#{robots => NewRobots}
                     end;
 
                 _ ->
@@ -841,71 +724,97 @@ send_next_window(RobotId, State) ->
 
 
 %%--------------------------------------------------------------------
+%% Prefetch: reserve + send the NEXT window BEFORE the robot's last
+%% step of the CURRENT window is executed.
+%%--------------------------------------------------------------------
+
+%% Called the moment a robot arrives at the second-to-last cell of its
+%% current window (i.e. exactly one reserved cell -- LastPos -- remains
+%% unwalked). Tries to reserve the segment of the path beyond LastPos
+%% and push it to the robot right away, ahead of the robot even
+%% attempting that final step. If it can't (conflict, or LastPos is
+%% actually the goal), it does nothing and leaves the "send once window
+%% is fully empty" fallback in handle_robot_move to handle it later.
+maybe_prefetch_next_window(RobotId, LastPos, State) ->
+    Robots = maps:get(robots, State),
+    Robot = maps:get(RobotId, Robots),
+    Path = maps:get(path, Robot),
+
+    case next_positions(LastPos, Path, window_size()) of
+
+        {ok, NextPositions} ->
+
+            case reserve_window(NextPositions, RobotId, State) of
+
+                ok ->
+                    NewWindow = [LastPos | NextPositions],
+                    NewState = store_window(RobotId, NewWindow, State),
+
+                    io:format(
+                        "Prefetched next window for ~p (before last "
+                        "step ~p executed): ~p~n",
+                        [RobotId, LastPos, NextPositions]
+                    ),
+
+                    Handler = maps:get(handler, Robot),
+                    Goal = maps:get(goal, Robot),
+
+                    Handler ! {send, {go, Goal, NextPositions}},
+
+                    NewState;
+
+                {error, _Blocked} ->
+                    %% Couldn't prefetch -- window map still has
+                    %% [LastPos]; the fallback branch will retry once
+                    %% LastPos is actually walked.
+                    State
+            end;
+
+        {error, goal_reached} ->
+            %% LastPos IS the goal -- nothing to prefetch.
+            State;
+
+        {error, _Reason} ->
+            State
+    end.
+
+
+%%--------------------------------------------------------------------
 %% Reservation handling
 %%--------------------------------------------------------------------
 
-% reserve_next_window(RobotId, State) ->
-
-%     Robots = maps:get(robots, State),
-%     Robot = maps:get(RobotId, Robots),
-
-%     Current = maps:get(current, Robot),
-%     Path = maps:get(path, Robot),
-
-%     case next_positions(
-%         Current,
-%         Path,
-%         window_size()
-%     ) of
-
-%         {ok, Positions} ->
-
-%             case reserve_window(
-%                 Positions,
-%                 RobotId,
-%                 State
-%             ) of
-
-%                 ok ->
-%                     {ok, State, Positions};
-
-%                 {error, _Blocked} ->
-%                     replan_and_reserve(
-%                         RobotId,
-%                         State
-%                     )
-%             end;
-
-%         {error, goal_reached} ->
-%             {error, no_path, State};
-
-%         {error, _Reason} ->
-%             replan_and_reserve(
-%                 RobotId,
-%                 State
-%             )
-%     end.
-
 reserve_next_window(RobotId, State) ->
+
     Robots = maps:get(robots, State),
     Robot = maps:get(RobotId, Robots),
+
     Current = maps:get(current, Robot),
     Path = maps:get(path, Robot),
 
-    case next_positions(Current, Path, ?WINDOW_SIZE) of
+    case next_positions(Current, Path, window_size()) of
+
         {ok, Positions} ->
+
             case reserve_window(Positions, RobotId, State) of
+
                 ok ->
                     {ok, store_window(RobotId, Positions, State), Positions};
+
                 {error, _Blocked} ->
                     replan_and_reserve(RobotId, State)
             end;
+
         {error, goal_reached} ->
             {error, no_path, State};
+
         {error, _Reason} ->
             replan_and_reserve(RobotId, State)
     end.
 
+
+%% Record which cells are currently reserved-but-not-yet-walked for
+%% this robot. Needed so handle_robot_move can tell "is this the
+%% second-to-last step?" without re-deriving it from the ETS table.
 store_window(RobotId, Window, State) ->
     Robots = maps:get(robots, State),
     Robot = maps:get(RobotId, Robots),
@@ -916,15 +825,9 @@ store_window(RobotId, Window, State) ->
 replan_robot(RobotId, State) ->
 
     State1 =
-        release_robot_reservations(
-            RobotId,
-            State
-        ),
+        release_robot_reservations(RobotId, State),
 
-    case maps:find(
-        RobotId,
-        maps:get(robots, State1)
-    ) of
+    case maps:find(RobotId, maps:get(robots, State1)) of
 
         error ->
             State1;
@@ -935,45 +838,23 @@ replan_robot(RobotId, State) ->
 
                 busy ->
 
-                    case replan_and_reserve(
-                        RobotId,
-                        State1
-                    ) of
+                    case replan_and_reserve(RobotId, State1) of
 
                         {ok, NewState, Window} ->
 
-                            Handler =
-                                maps:get(
-                                    handler,
-                                    Robot
-                                ),
+                            Handler = maps:get(handler, Robot),
+                            Goal = maps:get(goal, Robot),
 
-                            Goal =
-                                maps:get(
-                                    goal,
-                                    Robot
-                                ),
-
-                            Handler !
-                                {send,
-                                 {go,
-                                  Goal,
-                                  Window}},
+                            Handler ! {send, {go, Goal, Window}},
 
                             NewState;
 
                         {error, no_path, NewState} ->
 
-                            Robots =
-                                maps:get(
-                                    robots,
-                                    NewState
-                                ),
+                            Robots = maps:get(robots, NewState),
 
                             UpdatedRobot =
-                                Robot#{
-                                    status => waiting
-                                },
+                                Robot#{status => waiting},
 
                             NewState#{
                                 robots =>
@@ -1001,71 +882,38 @@ replan_and_reserve(RobotId, State) ->
 
     Obstacles = maps:get(obstacles, State),
 
-    Reserved =
-        reserved_positions(
-            RobotId,
-            State
-        ),
+    Reserved = reserved_positions(RobotId, State),
 
-    ReplanObstacles =
-        lists:usort(
-            Obstacles ++ Reserved
-        ),
+    ReplanObstacles = lists:usort(Obstacles ++ Reserved),
 
-    case robo_pathfinder:find_path(
-        Current,
-        Goal,
-        ReplanObstacles
-    ) of
+    case robo_pathfinder:find_path(Current, Goal, ReplanObstacles) of
 
         {ok, Path} ->
 
-            UpdatedRobot =
-                Robot#{
-                    path => Path
-                },
+            UpdatedRobot = Robot#{path => Path},
 
             NewRobots =
-                maps:put(
-                    RobotId,
-                    UpdatedRobot,
-                    Robots
-                ),
+                maps:put(RobotId, UpdatedRobot, Robots),
 
-            State1 =
-                State#{
-                    robots => NewRobots
-                },
+            State1 = State#{robots => NewRobots},
 
-            case next_positions(
-                Current,
-                Path,
-                window_size()
-            ) of
+            case next_positions(Current, Path, window_size()) of
 
                 {ok, Positions} ->
 
-                    case reserve_window(
-                        Positions,
-                        RobotId,
-                        State1
-                    ) of
+                    case reserve_window(Positions, RobotId, State1) of
 
                         ok ->
                             {ok,
-                             State1,
+                             store_window(RobotId, Positions, State1),
                              Positions};
 
                         {error, _} ->
-                            {error,
-                             no_path,
-                             State1}
+                            {error, no_path, State1}
                     end;
 
                 {error, _} ->
-                    {error,
-                     no_path,
-                     State1}
+                    {error, no_path, State1}
             end;
 
         {error, no_path} ->
@@ -1073,72 +921,30 @@ replan_and_reserve(RobotId, State) ->
     end.
 
 
-reserve_window(
-    Positions,
-    RobotId,
-    State
-) ->
-
-    Table =
-        maps:get(
-            reservations,
-            State
-        ),
-
-    reserve_window(
-        Positions,
-        RobotId,
-        Table,
-        []
-    ).
+reserve_window(Positions, RobotId, State) ->
+    Table = maps:get(reservations, State),
+    reserve_window(Positions, RobotId, Table, []).
 
 
-reserve_window(
-    [],
-    _RobotId,
-    _Table,
-    _Reserved
-) ->
+reserve_window([], _RobotId, _Table, _Reserved) ->
     ok;
 
+reserve_window([Position | Rest], RobotId, Table, Reserved) ->
 
-reserve_window(
-    [Position | Rest],
-    RobotId,
-    Table,
-    Reserved
-) ->
-
-    case ets:insert_new(
-        Table,
-        {Position, RobotId}
-    ) of
+    case ets:insert_new(Table, {Position, RobotId}) of
 
         true ->
-
-            reserve_window(
-                Rest,
-                RobotId,
-                Table,
-                [Position | Reserved]
-            );
+            reserve_window(Rest, RobotId, Table, [Position | Reserved]);
 
         false ->
 
-            %% Roll back reservations made for
-            %% this window if one position failed.
+            %% Roll back reservations made for this window if one
+            %% position failed.
             lists:foreach(
                 fun(P) ->
-                    case ets:lookup(
-                        Table,
-                        P
-                    ) of
-
-                        [{P, RobotId}] ->
-                            ets:delete(Table, P);
-
-                        _ ->
-                            ok
+                    case ets:lookup(Table, P) of
+                        [{P, RobotId}] -> ets:delete(Table, P);
+                        _ -> ok
                     end
                 end,
                 Reserved
@@ -1148,58 +954,25 @@ reserve_window(
     end.
 
 
-release_position(
-    Position,
-    RobotId,
-    State
-) ->
+release_position(Position, RobotId, State) ->
 
-    Table =
-        maps:get(
-            reservations,
-            State
-        ),
+    Table = maps:get(reservations, State),
 
-    case ets:lookup(
-        Table,
-        Position
-    ) of
-
-        [{Position, RobotId}] ->
-            ets:delete(
-                Table,
-                Position
-            );
-
-        _ ->
-            ok
+    case ets:lookup(Table, Position) of
+        [{Position, RobotId}] -> ets:delete(Table, Position);
+        _ -> ok
     end.
 
 
-release_robot_reservations(
-    RobotId,
-    State
-) ->
+release_robot_reservations(RobotId, State) ->
 
-    Table =
-        maps:get(
-            reservations,
-            State
-        ),
+    Table = maps:get(reservations, State),
 
     lists:foreach(
         fun({Position, ReservedBy}) ->
-
             case ReservedBy =:= RobotId of
-
-                true ->
-                    ets:delete(
-                        Table,
-                        Position
-                    );
-
-                false ->
-                    ok
+                true -> ets:delete(Table, Position);
+                false -> ok
             end
         end,
         ets:tab2list(Table)
@@ -1208,37 +981,15 @@ release_robot_reservations(
     State.
 
 
-%% Does this robot still have positions reserved?
-has_reservations(RobotId, State) ->
-
-    Table =
-        maps:get(
-            reservations,
-            State
-        ),
-
-    lists:any(
-        fun({_Position, ReservedBy}) ->
-            ReservedBy =:= RobotId
-        end,
-        ets:tab2list(Table)
-    ).
-
-
 %% Return all positions reserved by OTHER robots.
 reserved_positions(RobotId, State) ->
 
-    Table =
-        maps:get(
-            reservations,
-            State
-        ),
+    Table = maps:get(reservations, State),
 
     [
         Position
         ||
-        {Position, OtherRobot} <-
-            ets:tab2list(Table),
+        {Position, OtherRobot} <- ets:tab2list(Table),
         OtherRobot =/= RobotId
     ].
 
@@ -1249,28 +1000,13 @@ reserved_positions(RobotId, State) ->
 
 process_waiting_robots(State) ->
 
-    Robots =
-        maps:get(
-            robots,
-            State
-        ),
+    Robots = maps:get(robots, State),
 
     lists:foldl(
         fun({RobotId, Robot}, AccState) ->
-
-            case maps:get(
-                status,
-                Robot
-            ) of
-
-                waiting ->
-                    replan_waiting_robot(
-                        RobotId,
-                        AccState
-                    );
-
-                _ ->
-                    AccState
+            case maps:get(status, Robot) of
+                waiting -> replan_waiting_robot(RobotId, AccState);
+                _ -> AccState
             end
         end,
         State,
@@ -1278,102 +1014,43 @@ process_waiting_robots(State) ->
     ).
 
 
-replan_waiting_robot(
-    RobotId,
-    State
-) ->
+replan_waiting_robot(RobotId, State) ->
 
-    Robots =
-        maps:get(
-            robots,
-            State
-        ),
+    Robots = maps:get(robots, State),
+    Robot = maps:get(RobotId, Robots),
 
-    Robot =
-        maps:get(
-            RobotId,
-            Robots
-        ),
+    Current = maps:get(current, Robot),
+    Goal = maps:get(goal, Robot),
 
-    Current =
-        maps:get(
-            current,
-            Robot
-        ),
+    Obstacles = maps:get(obstacles, State),
+    Reserved = reserved_positions(RobotId, State),
 
-    Goal =
-        maps:get(
-            goal,
-            Robot
-        ),
+    ReplanObstacles = lists:usort(Obstacles ++ Reserved),
 
-    Obstacles =
-        maps:get(
-            obstacles,
-            State
-        ),
-
-    Reserved =
-        reserved_positions(
-            RobotId,
-            State
-        ),
-
-    ReplanObstacles =
-        lists:usort(
-            Obstacles ++ Reserved
-        ),
-
-    case robo_pathfinder:find_path(
-        Current,
-        Goal,
-        ReplanObstacles
-    ) of
+    case robo_pathfinder:find_path(Current, Goal, ReplanObstacles) of
 
         {ok, Path} ->
 
             UpdatedRobot =
-                Robot#{
-                    status => busy,
-                    path => Path
-                },
+                Robot#{status => busy, path => Path},
 
             State1 =
                 State#{
-                    robots =>
-                        maps:put(
-                            RobotId,
-                            UpdatedRobot,
-                            Robots
-                        )
+                    robots => maps:put(RobotId, UpdatedRobot, Robots)
                 },
 
-            case reserve_next_window(
-                RobotId,
-                State1
-            ) of
+            case reserve_next_window(RobotId, State1) of
 
                 {ok, State2, Window} ->
 
-                    Handler =
-                        maps:get(
-                            handler,
-                            Robot
-                        ),
+                    Handler = maps:get(handler, Robot),
 
-                    Handler !
-                        {send,
-                         {go,
-                          Goal,
-                          Window}},
+                    Handler ! {send, {go, Goal, Window}},
 
                     io:format(
                         "Waiting robot ~p can move again. "
                         "New window: ~p~n",
-                        [
-                            RobotId,
-                            Window
-                        ]
+                        [RobotId, Window]
                     ),
 
                     State2;
@@ -1394,9 +1071,7 @@ replan_waiting_robot(
 expected_next(Current, Path) ->
 
     case lists:dropwhile(
-        fun(Position) ->
-            Position =/= Current
-        end,
+        fun(Position) -> Position =/= Current end,
         Path
     ) of
 
@@ -1411,16 +1086,10 @@ expected_next(Current, Path) ->
     end.
 
 
-next_positions(
-    Current,
-    Path,
-    WindowSize
-) ->
+next_positions(Current, Path, WindowSize) ->
 
     case lists:dropwhile(
-        fun(Position) ->
-            Position =/= Current
-        end,
+        fun(Position) -> Position =/= Current end,
         Path
     ) of
 
@@ -1429,16 +1098,9 @@ next_positions(
 
         [_Current | Remaining] ->
 
-            case lists:sublist(
-                Remaining,
-                WindowSize
-            ) of
-
-                [] ->
-                    {error, goal_reached};
-
-                Positions ->
-                    {ok, Positions}
+            case lists:sublist(Remaining, WindowSize) of
+                [] -> {error, goal_reached};
+                Positions -> {ok, Positions}
             end
     end.
 
@@ -1449,24 +1111,13 @@ next_positions(
 
 terminate(_Reason, State) ->
 
-    case maps:find(
-        reservations,
-        State
-    ) of
-
-        {ok, Table} ->
-            ets:delete(Table);
-
-        error ->
-            ok
+    case maps:find(reservations, State) of
+        {ok, Table} -> ets:delete(Table);
+        error -> ok
     end,
 
     ok.
 
 
-code_change(
-    _OldVsn,
-    State,
-    _Extra
-) ->
+code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
