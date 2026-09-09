@@ -15,7 +15,7 @@
 
 window_size() -> application:get_env(robo_server, window_size, 3).
 obstacles()   -> application:get_env(robo_server, obstacles, []).
-port() -> application:get_env(robo_robot, server_port, 5555).
+port() -> application:get_env(robo_server, tcp_port, 5555).
 
 
 
@@ -844,47 +844,73 @@ send_next_window(RobotId, State) ->
 %% Reservation handling
 %%--------------------------------------------------------------------
 
-reserve_next_window(RobotId, State) ->
+% reserve_next_window(RobotId, State) ->
 
+%     Robots = maps:get(robots, State),
+%     Robot = maps:get(RobotId, Robots),
+
+%     Current = maps:get(current, Robot),
+%     Path = maps:get(path, Robot),
+
+%     case next_positions(
+%         Current,
+%         Path,
+%         window_size()
+%     ) of
+
+%         {ok, Positions} ->
+
+%             case reserve_window(
+%                 Positions,
+%                 RobotId,
+%                 State
+%             ) of
+
+%                 ok ->
+%                     {ok, State, Positions};
+
+%                 {error, _Blocked} ->
+%                     replan_and_reserve(
+%                         RobotId,
+%                         State
+%                     )
+%             end;
+
+%         {error, goal_reached} ->
+%             {error, no_path, State};
+
+%         {error, _Reason} ->
+%             replan_and_reserve(
+%                 RobotId,
+%                 State
+%             )
+%     end.
+
+reserve_next_window(RobotId, State) ->
     Robots = maps:get(robots, State),
     Robot = maps:get(RobotId, Robots),
-
     Current = maps:get(current, Robot),
     Path = maps:get(path, Robot),
 
-    case next_positions(
-        Current,
-        Path,
-        window_size()
-    ) of
-
+    case next_positions(Current, Path, ?WINDOW_SIZE) of
         {ok, Positions} ->
-
-            case reserve_window(
-                Positions,
-                RobotId,
-                State
-            ) of
-
+            case reserve_window(Positions, RobotId, State) of
                 ok ->
-                    {ok, State, Positions};
-
+                    {ok, store_window(RobotId, Positions, State), Positions};
                 {error, _Blocked} ->
-                    replan_and_reserve(
-                        RobotId,
-                        State
-                    )
+                    replan_and_reserve(RobotId, State)
             end;
-
         {error, goal_reached} ->
             {error, no_path, State};
-
         {error, _Reason} ->
-            replan_and_reserve(
-                RobotId,
-                State
-            )
+            replan_and_reserve(RobotId, State)
     end.
+
+store_window(RobotId, Window, State) ->
+    Robots = maps:get(robots, State),
+    Robot = maps:get(RobotId, Robots),
+    UpdatedRobot = Robot#{window => Window},
+    State#{robots => maps:put(RobotId, UpdatedRobot, Robots)}.
 
 
 replan_robot(RobotId, State) ->
